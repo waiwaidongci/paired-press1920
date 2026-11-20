@@ -1,42 +1,74 @@
-import math
-from src.config.domain import DOMAIN
+"""严格的输入校验：失败即拒绝，不进入队列。
 
-def validate_values(values):
-    expected={f[0] for f in DOMAIN['fields']}
-    if set(values)!=expected: raise ValueError('字段必须为 '+', '.join(expected))
-    out={}
-    for key,label,kind in DOMAIN['fields']:
-        v=values[key]
-        if kind=='text':
-            if v not in ('A','B'): raise ValueError('工艺组必须为A或B')
-        else:
-            if isinstance(v,bool): raise ValueError(label+'必须是数值')
-            v=float(v)
-            if not math.isfinite(v) or abs(v)>1e9: raise ValueError(label+'必须为有限业务数值')
-            if v<0: raise ValueError(label+'不得为负')
-        out[key]=v
-    i=DOMAIN['index']
-    if i==0 and any(v>100 for v in out.values()): raise ValueError('百分比必须在0到100之间')
-    if i==1:
-        if any(out[k]!=int(out[k]) or out[k]>100000 for k in ('success','failure')): raise ValueError('计数必须为0到100000的整数')
-        if out['success']+out['failure']==0: raise ValueError('组内总数必须大于0')
-    if i==4:
-        if not 0<out['p0']<1 or not 0<out['p1']<1 or out['p0']==out['p1']: raise ValueError('两概率须在0和1之间且不同')
-        if out['cost_per_contact']<=0 or out['budget']<=0: raise ValueError('成本与预算须为正')
-    return out
+这些函数只做纯计算，便于在没有数据库的环境中独立验算。
+"""
+
+
+from src.config.domain import DOMAIN
+from src.services.algorithm import InputError, decimal_text, parse_decimal
+
+PROCESS_MAX = 40
+SOURCE_MAX = 100
+MAX_REPORTS_PER_STUDY = 200
+
+
+def _process(value, label):
+    if not isinstance(value, str):
+        raise ValueError(label + '必须为文本')
+    name = value.strip()
+    if not name:
+        raise ValueError(label + '不能为空')
+    if len(name) > PROCESS_MAX:
+        raise ValueError(f'{label}最多{PROCESS_MAX}个字符')
+    return name
+
+
+def validate_report(data):
+    """校验一份报告，返回规范化的字段（区间以精确十进制文本保存）。"""
+    if not isinstance(data, dict):
+        raise ValueError('报告格式错误')
+    source = data.get('source_key')
+    if not isinstance(source, str):
+        raise ValueError('报告来源编号必须为文本')
+    source = source.strip()
+    if not source:
+        raise ValueError('报告来源编号不能为空')
+    if len(source) > SOURCE_MAX:
+        raise ValueError(f'报告来源编号最多{SOURCE_MAX}个字符')
+    process_a = _process(data.get('process_a'), '工艺 A')
+    process_b = _process(data.get('process_b'), '工艺 B')
+    if process_a == process_b:
+        raise ValueError('同一报告的两道工艺必须不同')
+    try:
+        low = parse_decimal(data.get('low'), '差值下界')
+        high = parse_decimal(data.get('high'), '差值上界')
+    except InputError as e:
+        raise ValueError(str(e))
+    if low > high:
+        raise ValueError('差值下界不得大于上界')
+    return {
+        'source_key': source,
+        'process_a': process_a,
+        'process_b': process_b,
+        'low': decimal_text(low),
+        'high': decimal_text(high),
+    }
+
+
+def check_revision(current, expected):
+    """乐观并发：版本不一致就拒绝，避免覆盖他人的改录。"""
+    if expected is None:
+        return current
+    if isinstance(expected, bool) or not isinstance(expected, int) or expected < 1:
+        raise ValueError('版本号必须为正整数')
+    if expected != current:
+        raise ValueError(f'报告已被他人修改（当前版本 {current}），请刷新后重试')
+    return current + 1
+
 
 def validate_parameters(params):
-    defaults=DOMAIN['defaults']
-    if not isinstance(params,dict) or set(params)-set(defaults): raise ValueError('存在未知分析参数')
-    p=defaults|params
-    if 'field' in p and p['field'] not in [f[0] for f in DOMAIN['fields']]: raise ValueError('未知指标')
-    for key in ('resamples','simulations'):
-        if key in p:
-            v=p[key]
-            if isinstance(v,bool) or not isinstance(v,(int,float)) or int(v)!=v or not 200<=v<=20000: raise ValueError('重采样次数必须是200到20000的整数')
-            p[key]=int(v)
-    for key in ('alpha','power'):
-        if key in p:
-            p[key]=float(p[key])
-            if not math.isfinite(p[key]) or not (0.001<=p[key]<=0.2 if key=='alpha' else 0.5<=p[key]<=0.99): raise ValueError('显著性或功效超出范围')
-    return p
+    """分析参数严格白名单；本方法不接受任何可调参数。"""
+    defaults = DOMAIN['defaults']
+    if not isinstance(params, dict) or set(params) - set(defaults):
+        raise ValueError('存在未知分析参数')
+    return defaults | params
